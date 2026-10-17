@@ -58,6 +58,7 @@ mod roll_text;
 pub mod settings;
 pub mod shell;
 pub mod sound;
+pub mod splash;
 pub mod state;
 pub(crate) mod surface_chrome;
 pub mod syntax_cache;

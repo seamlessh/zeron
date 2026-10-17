@@ -2195,6 +2195,8 @@ pub struct Shell {
     /// A slow render must not give the native page and its titlebar different widths.
     render_time: Option<std::time::Instant>,
     splash: SplashPhase,
+    /// When the splash appeared: its animation's clock.
+    splash_started: std::time::Instant,
     splash_task: Option<Task<()>>,
     /// Focus fallback (registered on first paint — [`Shell::new`] has no
     /// window): keyboard shortcuts dispatch through the window focus chain, so
@@ -2560,6 +2562,7 @@ impl Shell {
             motion_active: std::cell::Cell::new(false),
             render_time: None,
             splash,
+            splash_started: std::time::Instant::now(),
             splash_task: None,
             focus_sub: None,
             shortcut_focus: cx.focus_handle(),
@@ -3023,9 +3026,25 @@ impl Shell {
         }
         match state.read(cx).connection {
             ConnectionStatus::Ready => {
-                if self.splash == SplashPhase::Visible {
-                    self.splash = SplashPhase::FadingOut;
+                if self.splash == SplashPhase::Visible && self.splash_task.is_none() {
+                    // Let dev-01 land before fading, so a fast engine does not
+                    // cut the intro off mid-condense. Reduce Motion shows a
+                    // still frame and needs no hold.
+                    let hold = if self.reduced_motion {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_secs_f32(crate::splash::LANDED)
+                            .saturating_sub(self.splash_started.elapsed())
+                    };
                     self.splash_task = Some(cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(hold).await;
+                        this.update(cx, |shell, cx| {
+                            if shell.splash == SplashPhase::Visible {
+                                shell.splash = SplashPhase::FadingOut;
+                                cx.notify();
+                            }
+                        })
+                        .ok();
                         cx.background_executor()
                             .timer(SPLASH_OUT.total() + Duration::from_millis(30))
                             .await;
@@ -3038,7 +3057,12 @@ impl Shell {
                 }
             }
             // Reveal the gate card immediately; the splash never returns mid-session.
-            ConnectionStatus::Failed(_) => self.splash = SplashPhase::Gone,
+            ConnectionStatus::Failed(_) => {
+                // Dropping a pending hold cancels it, so it cannot fade a
+                // splash back in over the gate card.
+                self.splash_task = None;
+                self.splash = SplashPhase::Gone;
+            }
             ConnectionStatus::Connecting => {}
         }
     }
@@ -13313,13 +13337,16 @@ impl Render for Shell {
 
         // Boot splash overlay: visible → crossfades out on Ready → removed.
         let root = match self.splash {
-            SplashPhase::Visible => {
+            SplashPhase::Visible | SplashPhase::FadingOut => {
                 let theme = Theme::of(cx).clone();
-                root.child(loaders::splash_overlay(&theme, false, cx.entity_id(), cx))
-            }
-            SplashPhase::FadingOut => {
-                let theme = Theme::of(cx).clone();
-                root.child(loaders::splash_overlay(&theme, true, cx.entity_id(), cx))
+                let clock = if self.reduced_motion {
+                    crate::splash::STILL
+                } else {
+                    window.request_animation_frame();
+                    self.splash_started.elapsed().as_secs_f32()
+                };
+                let fading = self.splash == SplashPhase::FadingOut;
+                root.child(crate::splash::overlay(&theme, fading, clock, cx))
             }
             SplashPhase::Gone => root,
         };
